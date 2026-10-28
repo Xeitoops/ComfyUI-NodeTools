@@ -1,0 +1,17 @@
+[project]
+name = "nodetools"
+description = "Insert a node into a link, detach nodes, replace a node, or swap two nodes — all from the right-click menu."
+version = "1.0.0"
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/Xeitoops/ComfyUI-NodeTools"
+"Bug Tracker" = "https://github.com/Xeitoops/ComfyUI-NodeTools/issues"
+
+[tool.comfy]
+PublisherId = "bluue"
+DisplayName = "ComfyUI-NodeTools"
