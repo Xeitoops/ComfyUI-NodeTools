@@ -1,0 +1,15 @@
+# Python 缓存（含编译时的本机绝对路径，不要提交）
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 临时文件
+*.log
+*.tmp
