@@ -13,3 +13,10 @@ desktop.ini
 # 临时文件
 *.log
 *.tmp
+
+# 本地改代码前留的备份（.bak / .bak-日期 / .orig / .改版N）
+*.bak
+*.bak-*
+*.orig
+*.rej
+*~

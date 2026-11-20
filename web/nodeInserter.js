@@ -55,7 +55,7 @@
 import { app } from "../../scripts/app.js";
 
 const EXT_NAME = "ComfyUI.NodeInserter";
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const LOG = "[NodeInserter]";
 
 /* ============================================================
@@ -819,21 +819,47 @@ function nodeTag(n) {
   return n ? `${nodeName(n)}#${n.id}` : "?";
 }
 
+/**
+ * 节点是不是被旁路 / 被静音。
+ *
+ * litegraph / ComfyUI 用 `node.mode` 记这个，**不影响连线**，所以只看连线表
+ * 完全看不出来 —— 可它决定这个节点在运行图上还是不在，排查时非常关键：
+ * 一个 mode=4 的节点夹在中间，它的输入输出「接着」但整条链是被绕过的。
+ *
+ * 0 = 正常 · 2 = 静音（NEVER）· 4 = 旁路（BYPASS）
+ */
+function nodeModeTag(n) {
+  const m = n?.mode ?? 0;
+  if (m === 4) return "【旁路】";
+  if (m === 2) return "【静音】";
+  if (m && m !== 0) return `【mode=${m}】`;
+  return "";
+}
+
 function dumpNodeLines(node, graph) {
   if (!node) return ["(节点不存在)"];
   const rows = [];
 
   rows.push(
     `── ${nodeTag(node)}  [type=${node.type}]  `
-      + `pos ${Math.round(node.pos?.[0] ?? 0)},${Math.round(node.pos?.[1] ?? 0)}`,
+      + `pos ${Math.round(node.pos?.[0] ?? 0)},${Math.round(node.pos?.[1] ?? 0)}`
+      + nodeModeTag(node),
   );
 
   (node.inputs ?? []).forEach((s, i) => {
     const l = getLink(graph, s?.link);
+    if (!l) {
+      rows.push(`  in  [${i}] ${s.name} (${s.type})  ←  —`);
+      return;
+    }
+    // 同上：以线上记的 target_slot 为准
+    const ts = l.target_slot;
+    const real = (node.inputs ?? [])[ts];
+    const name = real?.name ?? s.name;
+    const type = real?.type ?? s.type;
+    const tag = ts === i ? "" : `　⚠实际槽位 in[${ts}]（挂在 in[${i}] 的 link 上）`;
     rows.push(
-      l
-        ? `  in  [${i}] ${s.name} (${s.type})  ←  ${nodeTag(graph.getNodeById(l.origin_id))}.out[${l.origin_slot}]  link.type=${l.type}`
-        : `  in  [${i}] ${s.name} (${s.type})  ←  —`,
+      `  in  [${ts}] ${name} (${type})  ←  ${nodeTag(graph.getNodeById(l.origin_id))}.out[${l.origin_slot}]  link.type=${l.type}${tag}`,
     );
   });
 
@@ -845,10 +871,20 @@ function dumpNodeLines(node, graph) {
     }
     for (const id of ids) {
       const l = getLink(graph, id);
+      if (!l) {
+        rows.push(`  out [${i}] ${s.name} (${s.type})  →  link#${id} 已失效`);
+        continue;
+      }
+      // 以**线上真实记的槽位号**为准：真正接线时用的就是 link.origin_slot，
+      // 打印「它挂在哪个槽的 links 数组里」会和实际不符（曾经把 out[0] 报成 out[1]，
+      // 让人以为接的是另一个同名类型的口）。两者不一致时把实情也标出来。
+      const os = l.origin_slot;
+      const real = (node.outputs ?? [])[os];
+      const name = real?.name ?? s.name;
+      const type = real?.type ?? s.type;
+      const tag = os === i ? "" : `　⚠实际槽位 out[${os}]（挂在 out[${i}] 的 links 下）`;
       rows.push(
-        l
-          ? `  out [${i}] ${s.name} (${s.type})  →  ${nodeTag(graph.getNodeById(l.target_id))}.in[${l.target_slot}]  link.type=${l.type}`
-          : `  out [${i}] ${s.name} (${s.type})  →  link#${id} 已失效`,
+        `  out [${os}] ${name} (${type})  →  ${nodeTag(graph.getNodeById(l.target_id))}.in[${l.target_slot}]  link.type=${l.type}${tag}`,
       );
     }
   });
@@ -1071,8 +1107,10 @@ function insertNodeIntoLink(node, link, opts = {}) {
     if (!opts.noExtras) {
       try {
         const { plan, skipped } = planExtraLinks(node, link, outIdx, inIdx);
-        const auto = plan.filter((x) => x.parallel || x.intoTarget);
-        const ask = plan.filter((x) => !x.parallel && !x.intoTarget);
+        // 平行线、同下游、同一输出口的其它分支：都是「同一个数据换了个去处」，
+        // 不用问，直接跟着走。只有同上游、下游完全不相干的那种才需要点头。
+        const auto = plan.filter((x) => x.parallel || x.intoTarget || x.sameFanout);
+        const ask = plan.filter((x) => !x.parallel && !x.intoTarget && !x.sameFanout);
 
         const autoOk = applyExtras(node, auto);
         lastInsertAutoCount = autoOk;
@@ -1091,7 +1129,7 @@ function insertNodeIntoLink(node, link, opts = {}) {
             type: String(x.type),
             from: x.from,
             to: x.to,
-            kind: x.parallel ? "平行" : "同下游",
+            kind: x.parallel ? "平行" : x.sameFanout ? "同一输出的分支" : "同下游",
             inName: x.inName,
             outName: x.outName,
           })),
@@ -1148,6 +1186,7 @@ function insertNodeIntoLink(node, link, opts = {}) {
       bits.push(`补上 ${feedInfo.added} 个空口（${types}）`);
     }
     if (feedInfo?.rewired) bits.push(`改接 ${feedInfo.rewired} 条下游`);
+    if (feedInfo?.spliced?.length) bits.push(`串进 ${feedInfo.spliced.length} 条已有的线`);
 
     /* ---- 7. 报告：这次到底动了哪些线 ---- */
     // 只报个数没用。把「新节点上仍然空着的口」逐条列出来，
@@ -1166,6 +1205,7 @@ function insertNodeIntoLink(node, link, opts = {}) {
       `插入：${nodeTag(origin)}.out[${link.origin_slot}] → ${nodeTag(target)}.in[${link.target_slot}]（${inType}）`,
       `新节点：${nodeTag(node)}　进 in[${inIdx}] ${slotLabel(node, inIdx, true)} · 出 out[${outIdx}] ${slotLabel(node, outIdx, false)}`,
       `结果：主线 1 · 顺路 ${extraInfo?.autoOk ?? 0} · 补空口 ${feedInfo?.added ?? 0}`
+        + ` · 串进已连线 ${feedInfo?.spliced?.length ?? 0}`
         + ` · 改接下游 ${feedInfo?.rewired ?? 0} · 待确认 ${extraInfo?.ask?.length ?? 0}`
         + ` · 跳过 ${extraInfo?.skipped ?? 0}`,
       "",
@@ -1181,6 +1221,13 @@ function insertNodeIntoLink(node, link, opts = {}) {
     if (feedInfo?.pairs?.length) {
       sec.push("【往上找料补的空口】");
       for (const p of feedInfo.pairs) sec.push(`  ${p.type}  ${p.from} → [${p.to}]`);
+      sec.push("");
+    }
+    if (feedInfo?.spliced?.length) {
+      sec.push("【串进画布上已有的线】");
+      for (const p of feedInfo.spliced) {
+        sec.push(`  ${p.type}  ${p.from} → [${p.inName}] → [${p.outName}] → ${p.to}`);
+      }
       sec.push("");
     }
     if (feedInfo?.rewirePairs?.length) {
@@ -1384,10 +1431,17 @@ function planExtraLinks(node, primaryLink, primaryOutIdx = -1, primaryInIdx = -1
     const sameTarget = l.target_id === prim.target_id;
     if (!sameOrigin && !sameTarget) return;
 
+    // 同一个**输出口**扇出去的其它分支：值本来就是同一份。
+    // 插进其中一条，另外几条也该跟着走新节点 —— 否则同一个 CLIP 一半
+    // 穿过新节点、一半绕过它，图上就是「插了等于没插」。
+    // 这类只挪「下游端」、不碰上游，也不会换数据来源，所以不受下面
+    // 「必须落在这条线上」的限制（那条限制是防着去动别人的线）。
+    const sameOutSlot = sameOrigin && l.origin_slot === prim.origin_slot;
+
     // 兄弟线也得落在**这条线**上。同一个上游节点扇到别的线（同一个输出
     // 顺另一路跑、同时喂两路采样）不算兄弟，拉进来
     // 就等于凭空给另那条线换了个走向。旁边那条线原来怎么接，就让它怎么接。
-    if (line.size && !line.has(l.target_id)) return;
+    if (!sameOutSlot && line.size && !line.has(l.target_id)) return;
 
     seen.add(l.id);
 
@@ -1438,6 +1492,8 @@ function planExtraLinks(node, primaryLink, primaryOutIdx = -1, primaryInIdx = -1
       // 把新节点插到它前面，它当然也该从新节点取料 —— 和「平行线」一样直接接，
       // 不再问一句（问了也只有一个合理答案，多端口节点插上去就等这一下）。
       intoTarget: sameTarget && !sameOrigin,
+      // 同一个输出口的其它分支：同一份数据换了个去处而已，跟着走就对了。
+      sameFanout: sameOutSlot && !sameTarget,
       origin,
       target,
       // 显示用：上游.输出 → 下游.输入
@@ -1691,15 +1747,75 @@ function isDownstreamOf(graph, src, node, maxDepth = 6) {
 }
 
 /**
+ * 从 start 往下走，能不能汇进 line 这个集合（最多 maxDepth 层）。
+ * 用来判断「这个下游跟这条线是不是同一股数据流」。
+ */
+function convergesInto(graph, start, line, maxDepth = 6) {
+  if (!graph || !start || !line || !line.size) return false;
+  const seen = new Set([start.id]);
+  let frontier = [start];
+
+  for (let d = 0; d < maxDepth && frontier.length; d++) {
+    const next = [];
+    for (const n of frontier) {
+      for (const o of n.outputs ?? []) {
+        for (const id of o?.links ?? []) {
+          const l = getLink(graph, id);
+          if (!l) continue;
+          if (line.has(l.target_id)) return true;
+          const t = graph.getNodeById(l.target_id);
+          if (!t || seen.has(t.id)) continue;
+          seen.add(t.id);
+          next.push(t);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return false;
+}
+
+/**
+ * 同一个上游输出口**扇出**（一根输出喂两个以上下游）、但**不在这条线上**的下游。
+ *
+ * 只收「往下走还会汇回这条线」的那种：它的数据本来就跟这条线流到同一处，
+ * 让它穿过新节点既没有换来源，也没有拐跑旁边另一条流程。
+ * 汇不回来的（比如同一个输出顺带喂着另一路采样）一律不收 ——
+ * 那种改接等于悄悄把别人那条线的数据换掉，是不该碰的。
+ *
+ * 另外还要求这个口真的是「扇出」（≥2 条线）：只有一条线、却又不在这条线上，
+ * 说明那是另一条流程借道，插这里不该把它拽过来。
+ */
+function fanoutConverging(graph, src, oi, line, maxDepth = 6) {
+  const out = [];
+  if (!src || !line || !line.size) return out;
+  const ids = src.outputs?.[oi]?.links ?? [];
+  if (ids.length < 2) return out;
+  for (const id of ids) {
+    const l = getLink(graph, id);
+    const t = l && graph.getNodeById(l.target_id);
+    if (!t || line.has(t.id)) continue; // 本线上的归其它候选管
+    if (convergesInto(graph, t, line, maxDepth)) out.push(t);
+  }
+  return out;
+}
+
+/**
  * 候选下游，按优先级排。前提：**只在这条线的下游里挑**。
  *   ① 这个上游输出原本就喂着、而且落在这条线上的下游（改接用）
  *   ② 插入时那条线的下游
  *   ③ 新节点已经接上的下游
+ *   ④ 同源扇出、但会汇回这条线的下游（数据最后流到同一处，只是绕了外圈）
  *
  * 这里以前把「这个输出口喂着的**所有**下游」一股脑排第一优先，
  * 于是 checkpoint 的 CLIP 顺带喂着旁边那条线的节点时，就会先改接旁边那个，
  * 而插入这条线上真正空着口、该接的那个反而轮不到 —— 报告看着接上了，
  * 图上却还是差一条。
+ *
+ * ④ 是后来补的一档，排在最后：同一份数据喂着好几个下游时（一个 CLIP 同时
+ * 喂正负两路编码器），只认这条线会一个都够不着 —— 输入补进来了、出口全空，
+ * 那几个下游还接着上游，看着就是「新节点被绕过」。收 ④ 的时候仍然带着
+ * 「不许改别人那条线」的底线：必须往下会汇回这条线才算，纯支线一根不碰。
  */
 function downstreamCandidates(graph, node, preferred, src, oi, chain) {
   const out = [];
@@ -1726,6 +1842,8 @@ function downstreamCandidates(graph, node, preferred, src, oi, chain) {
       if (l) push(graph.getNodeById(l.target_id));
     }
   }
+  // 最后一档：同源扇出、但会汇回这条线的下游（上面那些一个都够不着才用它）
+  for (const t of fanoutConverging(graph, src, oi, line)) push(t);
   return out;
 }
 
@@ -1786,12 +1904,150 @@ function fillDownstream(node, outIdx, type, graph, start, maxDepth = 6) {
 }
 
 /**
+ * 画布上**已经连着**一根同类型的线，正好通到新节点下面的节点时，
+ * 把新节点串进那根线中间：源 → 新节点.输入 → 新节点.输出 → 下游.输入。
+ *
+ * 为什么要排在「往上找同类型输出」前面：
+ * 沿输入线往上溯只认类型，很容易抓到一根类型碰巧相同、语义却毫不相干的输出
+ * （一个块向量 STRING 喂给一个触发词 STRING），而画布上明明有一根现成的、
+ * 同类型的线正好通到新节点下面那个节点 —— 那才是用户本来会去串的那根。
+ * 有现成的线就串进去，比凭空拉一根新的更接近用户的接法。
+ *
+ * 只动「本轮刚补上去的那根输入」，用户原来的线一根不碰；
+ * 每接一步都验，接不上就原样放回去。
+ */
+function spliceIntoExistingLines(node, graph, res) {
+  const done = [];
+  const seen = new Set([node.id]);
+
+  // 新节点现在正喂着的下游（含前面刚改接过来的那些）
+  const downs = [];
+  for (const o of node.outputs ?? []) {
+    for (const id of o?.links ?? []) {
+      const l = getLink(graph, id);
+      const t = l && graph.getNodeById(l.target_id);
+      if (t && !seen.has(t.id)) {
+        seen.add(t.id);
+        downs.push(t);
+      }
+    }
+  }
+
+  for (const d of downs) {
+    for (let si = 0; si < (d.inputs ?? []).length; si++) {
+      const slot = d.inputs[si];
+      const l = getLink(graph, slot?.link);
+      // 这个口空着，或者已经被新节点自己喂着了，都不用管
+      if (!l || l.origin_id === node.id) continue;
+      const src = graph.getNodeById(l.origin_id);
+      if (!src) continue;
+
+      const type = linkTypeOf(l);
+
+      // 新节点上收这个类型的输入口：优先空着的；
+      // 没有空的，就把本轮刚补的那根让出来（它本来就是碰巧同类型，该换掉）
+      let inIdx = (node.inputs ?? []).findIndex(
+        (s) => isAutoPort(s) && sameType(s.type, type) && slotIsFree(s, true),
+      );
+      let dropAt = -1;
+      if (inIdx < 0) {
+        const k = (res.pairs ?? []).findIndex(
+          (p) => p.inIdx != null && sameType(node.inputs?.[p.inIdx]?.type, type),
+        );
+        if (k >= 0) {
+          inIdx = res.pairs[k].inIdx;
+          dropAt = k;
+        }
+      }
+      if (inIdx < 0) continue;
+
+      const outIdx = (node.outputs ?? []).findIndex(
+        (s) => isAutoPort(s) && sameType(s.type, type) && slotIsFree(s, false),
+      );
+      if (outIdx < 0) continue;
+
+      const backtrack = () => {
+        safeConnect(src, l.origin_slot, d, si, l.parentId ?? null);
+      };
+
+      // 让出的那根（本轮刚补的、类型碰巧相同的输入）要能还原：
+      // 串不进去时把它按原样接回去，别让新节点白丢一个输入。
+      let dropped = null;
+      if (dropAt >= 0) {
+        const p = res.pairs[dropAt];
+        const ps = graph.getNodeById(p?.srcId);
+        if (ps && typeof p?.oi === "number") dropped = { node: ps, slot: p.oi, inIdx: p.inIdx, i: dropAt };
+      }
+      const restoreDropped = () => {
+        if (dropped && safeConnect(dropped.node, dropped.slot, node, dropped.inIdx, null)) {
+          res.pairs.splice(dropped.i, 0, {
+            type: String(type),
+            from: `${nodeName(dropped.node)}.${slotLabel(dropped.node, dropped.slot, false)}`,
+            to: slotLabel(node, dropped.inIdx, true),
+            inIdx: dropped.inIdx,
+            srcId: dropped.node.id,
+            oi: dropped.slot,
+          });
+          res.added++;
+        }
+      };
+
+      // 断开下游端 → 源接到新节点 → 新节点接回下游
+      try {
+        d.disconnectInput(si);
+      } catch (err) {
+        /* ignore */
+      }
+      if (dropAt >= 0) {
+        try {
+          node.disconnectInput(inIdx);
+        } catch (err) {
+          /* ignore */
+        }
+        res.pairs.splice(dropAt, 1);
+        res.added = Math.max(0, res.added - 1);
+      }
+
+      const a = safeConnect(src, l.origin_slot, node, inIdx, l.parentId ?? null);
+      if (!a) {
+        backtrack();
+        restoreDropped();
+        continue;
+      }
+      const b = safeConnect(node, outIdx, d, si, null);
+      if (!b) {
+        // 出口接不上：把刚接的输入也拆掉，再把原来那根放回去，不留半截
+        try {
+          node.disconnectInput(inIdx);
+        } catch (err) {
+          /* ignore */
+        }
+        backtrack();
+        restoreDropped();
+        continue;
+      }
+
+      done.push({
+        type: String(type),
+        from: `${nodeName(src)}.${slotLabel(src, l.origin_slot, false)}`,
+        to: `${nodeName(d)}.${slotLabel(d, si, true)}`,
+        inName: slotLabel(node, inIdx, true),
+        outName: slotLabel(node, outIdx, false),
+      });
+    }
+  }
+
+  res.spliced = done;
+  return done;
+}
+
+/**
  * @param {LGraphNode} node 刚插进去的节点
  * @param {object} opts { target } 插入时那条线的下游
- * @returns {{added:number, pairs:Array, rewired:number, rewirePairs:Array, left:Array}}
+ * @returns {{added:number, pairs:Array, rewired:number, rewirePairs:Array, spliced:Array, left:Array}}
  */
 function feedEmptyInputs(node, graph, opts = {}) {
-  const res = { added: 0, pairs: [], rewired: 0, rewirePairs: [], left: [] };
+  const res = { added: 0, pairs: [], rewired: 0, rewirePairs: [], spliced: [], left: [] };
   if (!node || !graph) return res;
 
   const sources = upstreamSources(node, graph, 6);
@@ -1843,6 +2099,9 @@ function feedEmptyInputs(node, graph, opts = {}) {
         type: String(out.type),
         from: `${nodeName(src)}.${slotLabel(src, oi, false)}`,
         to: slotLabel(node, inIdx, true),
+        inIdx, // 记下是哪一格：后面「已有线串进来」时要把这根让出去
+        srcId: src.id, // 让位失败时好把它原样接回来
+        oi,
       });
 
       /* ---- 出口：先沿这条线就近找空口，再谈改接 ---- */
@@ -1866,49 +2125,53 @@ function feedEmptyInputs(node, graph, opts = {}) {
       // 这条线：插入点原本的下游往下的那一串（含它自己）
       const chain = lineBelow(graph, opts.target);
 
+      /* ---- 先沿这条线就近找空口 ---- */
+      // 接到第一个就停：这是最不动原图的接法，能接空的就不动别人已经接好的口。
       const filled = fillDownstream(node, outIdx, out.type, graph, opts.target);
       if (filled.ok) {
-        rewired = 1;
+        rewired++;
         res.rewired++;
         res.rewirePairs.push({ type: String(out.type), to: filled.to });
       }
 
-      /* ---- 线上没有空口：把「原本绕过新节点、直连下游」的那条改接过来 ---- */
-      if (!rewired) {
-        for (const t of downstreamCandidates(graph, node, opts.target, src, oi, chain)) {
-          const ti = (t.inputs ?? []).findIndex((s, si) => {
-            if (taken.has(`${t.id}:${si}`)) return false;
-            const l = getLink(graph, s?.link);
-            return (
-              l &&
-              l.origin_id === src.id &&
-              l.origin_slot === oi &&
-              sameType(s.type, out.type)
-            );
-          });
-          if (ti < 0) continue;
+      /* ---- 线上没有空口：把「原本绕过新节点、直连下游」的那几条改接过来 ---- */
+      // 同一个输出口扇出去的**全部**下游都要走过一遍：一个 CLIP 常常同时喂着
+      // 正负两路编码器，只改第一个，另一路还连着上游 —— 图上就是「黄线仍然
+      // 绕过新节点」。这里不再只接一个，扇出几个就接几个；数据来源没变，
+      // 只是让它穿过新节点。真正的支线（汇不回这条线的）不进候选池，一根不碰。
+      for (const t of downstreamCandidates(graph, node, opts.target, src, oi, chain)) {
+        const ti = (t.inputs ?? []).findIndex((s, si) => {
+          if (taken.has(`${t.id}:${si}`)) return false;
+          const l = getLink(graph, s?.link);
+          return (
+            l &&
+            l.origin_id === src.id &&
+            l.origin_slot === oi &&
+            sameType(s.type, out.type)
+          );
+        });
+        if (ti < 0) continue;
 
-          const back = { node: t, slot: ti };
-          try {
-            t.disconnectInput(ti);
-          } catch (err) {
-            /* ignore */
-          }
-          const l2 = safeConnect(node, outIdx, t, ti, null);
-          if (l2) {
-            rewired++;
-            taken.add(`${t.id}:${ti}`);
-            res.rewirePairs.push({
-              type: String(out.type),
-              to: `${nodeName(t)}.${slotLabel(t, ti, true)}`,
-            });
-          } else {
-            // 接不上就把原来那条直连放回去，别留下断的线
-            safeConnect(src, oi, back.node, back.slot, null);
-          }
+        const back = { node: t, slot: ti };
+        try {
+          t.disconnectInput(ti);
+        } catch (err) {
+          /* ignore */
         }
-        res.rewired += rewired;
+        const l2 = safeConnect(node, outIdx, t, ti, null);
+        if (l2) {
+          rewired++;
+          taken.add(`${t.id}:${ti}`);
+          res.rewirePairs.push({
+            type: String(out.type),
+            to: `${nodeName(t)}.${slotLabel(t, ti, true)}`,
+          });
+        } else {
+          // 接不上就把原来那条直连放回去，别留下断的线
+          safeConnect(src, oi, back.node, back.slot, null);
+        }
       }
+      res.rewired += rewired;
 
       if (!rewired) {
         res.left.push({
@@ -1917,6 +2180,23 @@ function feedEmptyInputs(node, graph, opts = {}) {
         });
       }
     }
+  }
+
+  /* ---- 收尾：画布上已经有现成的同类型线，就把新节点串进去 ---- */
+  // 放在最后做，优先级最高：它会顶掉前面「往上找同类型输出」补的那根
+  // （那根只是类型碰巧相同，用户要的是串进真实存在的线）。
+  try {
+    spliceIntoExistingLines(node, graph, res);
+  } catch (err) {
+    console.warn(LOG, "串进已有连线时出错", err);
+  }
+
+  // 串进已有线之后，前面判的「没能接出去」可能已经不成立了：
+  // 那句话是说「这个类型暂时没出口」，可下一阶段又接上了。
+  // 只留真正还没接上的（按类型核对，同类型接上了就剔掉）。
+  if (res.spliced?.length) {
+    const filledTypes = new Set((res.spliced ?? []).map((p) => typeKeyOf(p.type)));
+    res.left = (res.left ?? []).filter((p) => !filledTypes.has(typeKeyOf(p.type)));
   }
 
   return res;
@@ -3389,6 +3669,62 @@ function buildSeparateItem(contextNode) {
   };
 }
 
+/**
+ * 「复制连线情况」——排查用。
+ *
+ * 出问题时不用截图、不用另存工作流发 JSON，也不用靠撤回回到某个状态：
+ * 右键点一下，每个节点、每个口连到哪儿就都在剪贴板里了，直接粘过来即可。
+ *
+ * 一次导**整张图**，不做「只看选中」的缩减：图上的节点是散的，
+ * 砍掉一部分反而看不出整体是怎么连的。
+ */
+function copyWiringDump() {
+  const g = app.graph;
+  const nodes = (g?._nodes ?? []).slice().sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+  if (!nodes.length) {
+    toast("info", "画布上还没有节点", null, 3200);
+    return "";
+  }
+
+  const header = [
+    `ComfyUI-NodeInserter v${VERSION} — 连线情况`,
+    `${nodes.length} 个节点`,
+  ];
+
+  // 旁路 / 静音的节点单独点一遍名：连线上完全看不出来，但会改变整条链的走向
+  const muted = nodes.filter((n) => (n.mode ?? 0) !== 0);
+  if (muted.length) {
+    header.push(
+      `含 ${muted.length} 个非正常节点：`
+        + muted.map((n) => `${nodeTag(n)}${nodeModeTag(n)}`).join(" · "),
+    );
+  }
+  header.push("");
+
+  const text = [...header, dumpText(nodes, g)].join("\n");
+  lastReport = text;
+
+  console.log(`${LOG} 连线情况\n${text}`);
+  let copied = false;
+  try {
+    const nav = globalThis.navigator;
+    if (nav?.clipboard?.writeText) {
+      nav.clipboard.writeText(text).then(() => {}, () => {});
+      copied = true;
+    }
+  } catch (err) {
+    /* 剪贴板不可用就只留 console */
+  }
+
+  toast(
+    "success",
+    copied ? "连线情况已复制到剪贴板" : "连线情况已写入控制台（F12）",
+    `${nodes.length} 个节点`,
+    3600,
+  );
+  return text;
+}
+
 /** 旧版前端兜底：包装 LGraphCanvas.prototype.getNodeMenuOptions */
 function patchLegacyMenu() {
   let proto = null;
@@ -3453,6 +3789,10 @@ app.registerExtension({
         }
         return `已导出 ${list.length} 个节点，并复制到剪贴板`;
       },
+      /** 排查用：nri.wiring() 整张图的连线情况（和右键「复制连线情况」同一份） */
+      wiring() {
+        return copyWiringDump();
+      },
       /** 排查用：nri.last() 取回上一次插入 / 分离的完整报告 */
       last() {
         return lastReport ?? "还没有执行过插入或分离。";
@@ -3484,7 +3824,12 @@ app.registerExtension({
 
   /** 兜底入口：选中节点后，画布空白处右键也能进入插入模式 */
   getCanvasMenuItems() {
-    if (!selectedNodes().length) return [];
-    return [buildMenuItem(null)];
+    const items = [];
+    if (selectedNodes().length) items.push(buildMenuItem(null));
+    items.push({
+      content: menuLang() === "zh" ? "📋 复制连线情况（NodeTools排查用）" : "📋 Copy wiring (NodeTools debug)",
+      callback: () => copyWiringDump(),
+    });
+    return items;
   },
 });
