@@ -15,10 +15,10 @@ import logging
 
 LOGGER = logging.getLogger(__name__)
 
-# 告诉 ComfyUI 去加载 ./web 下的前端脚本（目录下所有 .js 都会被加载）
+# Tell ComfyUI to load the frontend scripts under ./web (every .js is loaded)
 WEB_DIRECTORY = "./web"
 
-# 本扩展没有后端节点
+# No backend nodes in this extension
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
