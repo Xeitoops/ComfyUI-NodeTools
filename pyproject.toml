@@ -1,7 +1,7 @@
 [project]
 name = "nodetools"
 description = "Insert a node into a link, detach nodes, replace a node, or swap two nodes — all from the right-click menu."
-version = "1.0.0"
+version = "1.0.1"
 requires-python = ">=3.9"
 dependencies = []
 classifiers = [
