@@ -17,9 +17,20 @@
 
 ## 安装
 
-把整个文件夹放进 `ComfyUI/custom_nodes/`
+任选一种：
 
-重启 ComfyUI，刷新浏览器标签页（Ctrl+F5 强制刷新）。
+- **ComfyUI-Manager**：Manager →「Install via Git URL」，粘贴 `https://github.com/Xeitoops/ComfyUI-NodeTools`
+- **git**：在 `ComfyUI/custom_nodes/` 里运行
+
+  ```
+  git clone https://github.com/Xeitoops/ComfyUI-NodeTools
+  ```
+
+- **手动**：在 GitHub 页面点 Code → Download ZIP，解压后把整个文件夹放进 `ComfyUI/custom_nodes/`
+
+装好后重启 ComfyUI，刷新浏览器标签页（Ctrl+F5 强制刷新）。
+
+> 插件商店（Comfy Registry）上的版本目前在等人工审核，在 ComfyUI-Manager 里直接搜名字可能装不上，请先用上面的方法安装。
 
 ## 环境
 
