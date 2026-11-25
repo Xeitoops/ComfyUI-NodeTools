@@ -3,7 +3,7 @@
 import { app } from "../../scripts/app.js";
 
 const EXT_NAME = "ComfyUI.NodeInserter";
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const LOG = "[NodeInserter]";
 
 
@@ -438,8 +438,8 @@ function nodeAt(graph, x, y) {
 }
 
 
-function findLinkAt(x, y, tol) {
-  const graph = app.graph;
+function findLinkAt(x, y, tol, g) {
+  const graph = g ?? app.graph;
   if (!graph) return null;
 
 
@@ -2916,8 +2916,8 @@ let newMenuApiUsed = false;
 
 
 const MENU_I18N = {
-  zh: { insert: "插入到连线", sep: "从连线中分离" },
-  en: { insert: "Insert into link", sep: "Detach from link" },
+  zh: { insert: "插入到连线", sep: "从连线中分离", cut: "断开连线" },
+  en: { insert: "Insert into link", sep: "Detach from link", cut: "Disconnect link" },
 };
 
 function menuLang() {
@@ -2952,6 +2952,10 @@ function sepText() {
   return MENU_I18N[menuLang()].sep;
 }
 
+function cutText() {
+  return MENU_I18N[menuLang()].cut;
+}
+
 
 const EN_TEXT = {
 
@@ -2971,6 +2975,12 @@ const EN_TEXT = {
   "连线报告已写入控制台（F12）": "Wiring report printed to the console (F12)",
   "找不到画布": "Canvas not found",
   "图没有改动。": "Graph unchanged.",
+
+
+  "这条线已经不在了": "This link no longer exists",
+  "断开连线失败": "Disconnect failed",
+  "详情见控制台（F12）。": "See the console (F12) for details.",
+  "断开连线": "Disconnect link",
 
 
   "先选中要插入的节点": "Select the node to insert first",
@@ -3081,6 +3091,7 @@ const EN_TEXT = {
 const EN_RULES = [
 
   [/^已插入 (.+)$/, "Inserted $1"],
+  [/^已断开 (.+)$/, "Disconnected $1"],
   [/^已一起接上 1 条线$/, "Connected 1 link"],
   [/^已一起接上 (\d+) 条线$/, "Connected $1 links"],
   [/^接上了 (\d+) \/ (\d+) 条$/, "Connected $1 / $2 links"],
@@ -3408,16 +3419,213 @@ function patchLegacyMenu() {
   return true;
 }
 
+
+
+function liveLG() {
+  try {
+    return globalThis.__COMFY_LITEGRAPH_INSTANCE__ || LG();
+  } catch (err) {
+    return LG();
+  }
+}
+
+function presentationStore() {
+  try {
+    return piniaOf()?._s?.get?.("linkPresentation") ?? null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function linkIsHidden(graph, link) {
+  const store = presentationStore();
+  if (!store?.getPresentation || !graph || !link) return false;
+  try {
+    const scope = {
+      rootGraphId: graph.rootGraph?.id ?? graph.id,
+      owningGraphId: graph.id,
+    };
+    return store.getPresentation(scope, link.id)?.hidden === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function rerouteNear(graph, x, y, r) {
+  const store = graph?.reroutes;
+  if (!store) return false;
+  const list = typeof store.values === "function" ? [...store.values()] : Object.values(store);
+  return list.some((rr) => rr?.pos && Math.hypot(x - rr.pos[0], y - rr.pos[1]) <= r);
+}
+
+function linkUnderPointer(canvas, e) {
+  const graph = canvas?.graph;
+  if (!graph || !e) return null;
+  const x = e.canvasX;
+  const y = e.canvasY;
+  if (!isFinite(x) || !isFinite(y)) return null;
+
+  const L = liveLG();
+  if (canvas.links_render_mode === (L?.HIDDEN_LINK ?? -1)) return null;
+
+  const scale = canvas.ds?.scale || 1;
+  if (rerouteNear(graph, x, y, 12 / scale)) return null;
+
+  const link = findLinkAt(x, y, Math.max(5, 13 / scale), graph);
+  if (!link || linkIsHidden(graph, link)) return null;
+  return link;
+}
+
+function menuLinkOf(graph, segment, presentationLink) {
+  if (!graph) return null;
+  if (segment && segment.id != null && getLink(graph, segment.id) === segment) return segment;
+  if (presentationLink && presentationLink.id != null) return getLink(graph, presentationLink.id);
+  const ids = segment?.linkIds;
+  if (ids && typeof ids.values === "function" && ids.size === 1) {
+    return getLink(graph, ids.values().next().value);
+  }
+  return null;
+}
+
+function disconnectLink(graph, linkId) {
+  const g = graph ?? app.canvas?.graph ?? app.graph;
+  const link = getLink(g, linkId);
+  if (!g || !link) {
+    toast("warn", "这条线已经不在了", null, 3000);
+    return false;
+  }
+
+  const a = g.getNodeById?.(link.origin_id);
+  const b = g.getNodeById?.(link.target_id);
+  const from = `${nodeTag(a)}.out[${link.origin_slot}]`;
+  const to = `${nodeTag(b)}.in[${link.target_slot}]`;
+  const type = String(link.type ?? "*");
+
+  let ok = false;
+  beginChange();
+  try {
+    if (typeof g.removeLink === "function") g.removeLink(link.id);
+    else b?.disconnectInput?.(link.target_slot);
+    ok = !getLink(g, link.id);
+  } catch (err) {
+    console.error(LOG, "断开连线出错", err);
+  } finally {
+    endChange();
+  }
+
+  g.setDirtyCanvas?.(true, true);
+  app.canvas?.setDirty?.(true, true);
+
+  if (!ok) {
+    toast("error", "断开连线失败", "详情见控制台（F12）。", 6000);
+    return false;
+  }
+
+  lastReport = `ComfyUI-NodeInserter v${VERSION} — ${tr("断开连线")}\n${from} → ${to}  (${type})`;
+  console.log(LOG, "断开连线", { link: link.id, from, to, type });
+  toast("success", `已断开 ${nodeName(a)} → ${nodeName(b)}`, null, 2600);
+  return true;
+}
+
+function buildCutItem(graph, link) {
+  const id = link.id;
+  return {
+    content: `✂ ${cutText()}`,
+    callback: () => {
+      disconnectLink(graph, id);
+    },
+  };
+}
+
+let warnedLinkMenu = false;
+
+function patchLinkMenu() {
+  let proto = null;
+  try {
+    proto = app.canvas?.constructor?.prototype ?? LG()?.LGraphCanvas?.prototype ?? null;
+  } catch (err) {
+    proto = null;
+  }
+  if (!proto) return false;
+  if (typeof proto.showLinkMenu !== "function" || typeof proto.processContextMenu !== "function") {
+    console.warn(LOG, "这个前端版本没有 showLinkMenu / processContextMenu，右键断开连线不可用");
+    return false;
+  }
+  if (proto.__nriLinkMenuPatched) return true;
+
+  const origShow = proto.showLinkMenu;
+  proto.showLinkMenu = function (segment, e, presentationLink) {
+    const graph = this.graph ?? app.graph;
+    let link = null;
+    try {
+      link = menuLinkOf(graph, segment, presentationLink);
+    } catch (err) {
+      link = null;
+    }
+
+    const L = liveLG();
+    const Base = L?.ContextMenu;
+    if (!link || this.read_only || typeof Base !== "function") {
+      return origShow.apply(this, arguments);
+    }
+
+    const item = buildCutItem(graph, link);
+    let injected = false;
+    class WithCut extends Base {
+      constructor(values, options) {
+        if (!injected && Array.isArray(values)) {
+          injected = true;
+          values = [item, null, ...values];
+        }
+        super(values, options);
+      }
+    }
+
+    L.ContextMenu = WithCut;
+    try {
+      return origShow.apply(this, arguments);
+    } finally {
+      L.ContextMenu = Base;
+      if (!injected && !warnedLinkMenu) {
+        warnedLinkMenu = true;
+        console.warn(LOG, "连线菜单没走 LiteGraph.ContextMenu，「断开连线」没加上（前端可能改了实现）");
+      }
+    }
+  };
+
+  const origCtx = proto.processContextMenu;
+  proto.processContextMenu = function (node, event) {
+    if (!node && event && !this.read_only) {
+      let link = null;
+      try {
+        link = linkUnderPointer(this, event);
+      } catch (err) {
+        link = null;
+      }
+      if (link) {
+        this.showLinkMenu(link, event, link);
+        return;
+      }
+    }
+    return origCtx.apply(this, arguments);
+  };
+
+  proto.__nriLinkMenuPatched = true;
+  return true;
+}
+
 app.registerExtension({
   name: EXT_NAME,
 
   async setup() {
     patchLegacyMenu();
+    patchLinkMenu();
 
 
     window.nri = {
       version: VERSION,
       findLinkAt: (x, y) => findLinkAt(x, y, 13 / (app.canvas?.ds?.scale || 1)),
+      disconnectLink: (id) => disconnectLink(app.canvas?.graph ?? app.graph, id),
       arm: (node) => arm(node ? [node] : selectedNodes()),
       disarm,
       separate: (node) => separateNodes(node ? [node] : selectedNodes()),
@@ -3467,7 +3675,7 @@ app.registerExtension({
     };
 
     console.log(
-      `${LOG} v${VERSION} 已加载 — 右键节点 → 插入到连线… / 从连线中分离`
+      `${LOG} v${VERSION} 已加载 — 右键节点 → 插入到连线… / 从连线中分离；右键连线 → 断开连线`
     );
   },
 
